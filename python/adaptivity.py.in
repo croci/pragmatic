@@ -202,35 +202,42 @@ def patchwise_projection(dg_metric, mesh):
     #include <pybind11/cast.h>
 
     namespace py = pybind11;
-    namespace dolfin{
-        void project(const Function M, PETScVector& u, const Mesh mesh, std::shared_ptr<const FunctionSpace> space){
-            const std::size_t dim = mesh.geometry().dim();
-            const std::vector<int> vertex_map = vertex_to_dof_map(*space);
-            double init_vals[dim*dim];
-            memset( init_vals, 0, dim*dim*sizeof(double) );
-            Array<double> vals(dim*dim, init_vals);
-            double denom = 0.0;
-            double volume = 0.0;
-            unsigned count = 0;
-            unsigned len = u.local_size();
-            std::vector<double> values(len,0.0);
-            for (VertexIterator vertex(mesh); !vertex.end(); ++vertex){
-                for (CellIterator patch_cell(*vertex); !patch_cell.end(); ++patch_cell){
-                    Array<double> p(dim,patch_cell->midpoint().coordinates());
-                    M.eval(vals,p);
-                    volume = patch_cell->volume();
-                    for (unsigned i=0;i<dim*dim;i++)
-                        values[vertex_map[count + i]] += vals[i]*volume;
-                    denom += volume;
-                }
-                for (unsigned i=0;i<dim*dim;i++)
-                    values[vertex_map[count + i]] = values[vertex_map[count + i]]/denom;
-                denom = 0.0;
-                count += dim*dim;
-            }
-            u.set_local(values);
-        }
-
+    namespace dolfin
+    {
+      void project(const Function M, PETScVector& u, const Mesh mesh, std::shared_ptr<const FunctionSpace> space)
+      {
+	const std::size_t dim = mesh.geometry().dim();
+	const std::vector<int> vertex_map = vertex_to_dof_map(*space);
+	double init_vals[dim*dim];
+	memset( init_vals, 0, dim*dim*sizeof(double) );
+	Array<double> vals(dim*dim, init_vals);
+	double denom = 0.0;
+	double volume = 0.0;
+	unsigned count = 0;
+	unsigned len = u.local_size();
+	std::vector<double> values(len,0.0);
+	for (VertexIterator vertex(mesh); !vertex.end(); ++vertex)
+	{
+	    for (CellIterator patch_cell(*vertex); !patch_cell.end(); ++patch_cell)
+	    {
+		Array<double> p(dim,patch_cell->midpoint().coordinates());
+		M.eval(vals,p);
+		volume = patch_cell->volume();
+		for (unsigned i=0;i<dim*dim;i++)
+		{
+		values[vertex_map[count + i]] += vals[i]*volume;
+		}
+		denom += volume;
+	    }
+	    for (unsigned i=0;i<dim*dim;i++)
+	    {
+	    values[vertex_map[count + i]] = values[vertex_map[count + i]]/denom;
+	    }
+	    denom = 0.0;
+	    count += dim*dim;
+	}
+	u.set_local(values);
+      }
 	PYBIND11_MODULE(SIGNATURE, m){
             m.def("project", [](const py::object M, PETScVector& u, const Mesh mesh, const py::object V)
 	    {
@@ -411,7 +418,7 @@ def adapt_boundary_regions(original_mesh, adapted_mesh, original_regions):
 
     return adapted_regions
 
-def adapt(metric, bfaces=None, bfaces_func=None, colinearity_tol = 30, debugon=True, eta=1e-2, grada=None, maxN=None, coarsen=False):
+def adapt(metric, bfaces=None, bfaces_func=None, region_func = None, colinearity_tol = 30, debugon=True, eta=1e-2, grada=None, maxN=None, coarsen=False):
   #this is the actual adapt function. It currently works with vertex
   #numbers rather than DOF numbers, but as of DOLFIN.__VERSION__ >= "1.3.0",
   #there is no difference.
@@ -498,6 +505,11 @@ def adapt(metric, bfaces=None, bfaces_func=None, colinearity_tol = 30, debugon=T
 
   bfaces_IDs = numpy.array([bfaces_func[f.index()] for f in bfaces_list], dtype = numpy.intc)
 
+  if region_func is None:
+      region_IDs = numpy.zeros((mesh.num_cells(),), dtype=numpy.intc)
+  else:
+      region_IDs = region_func.array().astype(numpy.intc)
+
   x = coords[nodes,0]
   y = coords[nodes,1]
   if gdim == 3:
@@ -552,15 +564,21 @@ def adapt(metric, bfaces=None, bfaces_func=None, colinearity_tol = 30, debugon=T
                                        facets_array.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
                                        bfaces_IDs.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
 
+  info("Setting regions ...")
+  _libpragmatic.pragmatic_set_regions(region_IDs.ctypes.data_as(ctypes.POINTER(ctypes.c_int)))
+
+  info("Setting internal boundaries ...")
+  _libpragmatic.pragmatic_set_internal_boundaries()
+
   info("Setting metric tensor field ...")
   _libpragmatic.pragmatic_set_metric(metric_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
 
   info("Entering adapt ...")
   startTime = time()
   if coarsen:
-      _libpragmatic.pragmatic_coarsen(ctypes.c_int(1))
+      _libpragmatic.pragmatic_coarsen(ctypes.c_int(1), ctypes.c_int(1))
   else:
-      _libpragmatic.pragmatic_adapt(ctypes.c_int(1))
+      _libpragmatic.pragmatic_adapt(ctypes.c_int(1), ctypes.c_int(1))
 
   info("adapt took %0.1fs" % (time()-startTime))
   n_NNodes = ctypes.c_int()
@@ -592,6 +610,13 @@ def adapt(metric, bfaces=None, bfaces_func=None, colinearity_tol = 30, debugon=T
       n_mesh = set_mesh(array([n_x,n_y]),n_enlist,mesh=mesh,dx=dx,debugon=debugon)
   else:
       n_mesh = set_mesh(array([n_x,n_y,n_z]),n_enlist,mesh=mesh,dx=dx,debugon=debugon)
+
+  # extract element_tags from pragmatic
+  ptr = ctypes.POINTER(ctypes.c_int*n_NElements.value)()
+  _libpragmatic.pragmatic_get_elementTags(ctypes.byref(ptr))
+  element_tags = numpy.frombuffer(ptr.contents, dtype = numpy.intc)
+  element_func = MeshFunction("size_t", n_mesh, n_mesh.topology().dim(), 0)
+  element_func.array()[:] = element_tags
 
   # extracting boundary tags: pragmatic_get_boundaryTags returns an
   # array of the same size as n_enlist.
@@ -652,7 +677,7 @@ def adapt(metric, bfaces=None, bfaces_func=None, colinearity_tol = 30, debugon=T
   _libpragmatic.pragmatic_finalize()
   info("PRAgMaTIc adapt complete")
 
-  return n_mesh, n_bfaces_func
+  return n_mesh, n_bfaces_func, element_func
 
 def consistent_interpolation(mesh, fields=[]):
   if not isinstance(fields, list):
